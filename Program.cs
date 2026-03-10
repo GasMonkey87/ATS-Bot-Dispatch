@@ -26,11 +26,22 @@
 //    - POST /api/location/ping?guildId=...
 //    - GET  /api/location/latest?guildId=...
 //
+// ✅ NEW UPGRADE: ATS Dispatch bridge
+//    - GET  /api/dispatch/jobs?guildId=...
+//    - GET  /api/dispatch/active?guildId=...
+//    - GET  /api/dispatch/driver/{driverId}?guildId=...
+//    - POST /api/dispatch/accept/{id}?guildId=...
+//    - POST /api/dispatch/complete/{id}?guildId=...
+//    - GET  /api/dispatch/mods
+//    - Reads bridge JSON from Documents\OverWatchELD\DispatcherBridge
+//    - Fallback scans Documents\American Truck Simulator\mod for .scs/.zip
+//
 // ⚠️ Nothing else changed.
 
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Reflection;
@@ -109,6 +120,26 @@ internal static class Program
     private static PerformanceStore? _perfStore;
     private static readonly string PerfDir = Path.Combine(DataDir, "performance");
 
+    // -----------------------------
+    // ✅ ATS Dispatch bridge store
+    // Reads dispatcher bridge files + ATS mod folder fallback
+    // -----------------------------
+    private static AtsDispatchStore? _atsDispatchStore;
+    private static readonly string UserDocsDir =
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments) ?? "";
+    private static readonly string AtsBridgeDir =
+        Path.Combine(UserDocsDir, "OverWatchELD", "DispatcherBridge");
+    private static readonly string DispatchQueuePath =
+        Path.Combine(AtsBridgeDir, "dispatch_queue.json");
+    private static readonly string DispatchActivePath =
+        Path.Combine(AtsBridgeDir, "active_jobs.json");
+    private static readonly string DispatchFeedPath =
+        Path.Combine(AtsBridgeDir, "eld_dispatch_feed.json");
+    private static readonly string DispatchCompletedPath =
+        Path.Combine(AtsBridgeDir, "completed_jobs.json");
+    private static readonly string AtsModDir =
+        Path.Combine(UserDocsDir, "American Truck Simulator", "mod");
+
     // ===============================
     // ✅ LIVE MAP: Driver location pings (in-memory latest)
     // ===============================
@@ -133,18 +164,449 @@ internal static class Program
     // Models
     // -----------------------------
     private sealed class VtcDriver
-{
-    public string DriverId { get; set; } = Guid.NewGuid().ToString("N"); // stable id
-    public string Name { get; set; } = "";
-    public string? DiscordUserId { get; set; } // optional
-    public string? DiscordUsername { get; set; } // optional
-    public string? TruckNumber { get; set; }
-    public string? Role { get; set; }          // Driver/Dispatcher/Admin/etc
-    public string? Status { get; set; }        // Active/Inactive
-    public string? Notes { get; set; }
-    public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset UpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
-}
+    {
+        public string DriverId { get; set; } = Guid.NewGuid().ToString("N"); // stable id
+        public string Name { get; set; } = "";
+        public string? DiscordUserId { get; set; } // optional
+        public string? DiscordUsername { get; set; } // optional
+        public string? TruckNumber { get; set; }
+        public string? Role { get; set; }          // Driver/Dispatcher/Admin/etc
+        public string? Status { get; set; }        // Active/Inactive
+        public string? Notes { get; set; }
+        public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;
+        public DateTimeOffset UpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    // -----------------------------
+    // ✅ ATS Dispatch models
+    // -----------------------------
+    private sealed class AtsDispatchJob
+    {
+        public string Id { get; set; } = "";
+        public string GuildId { get; set; } = "0";
+        public string Source { get; set; } = "dispatcher";
+        public string? Title { get; set; }
+        public string? Cargo { get; set; }
+        public string? Trailer { get; set; }
+        public string? Origin { get; set; }
+        public string? Destination { get; set; }
+        public string? OriginCity { get; set; }
+        public string? DestinationCity { get; set; }
+        public string? Company { get; set; }
+        public string? ModName { get; set; }
+        public double DistanceMiles { get; set; }
+        public string Status { get; set; } = "available";
+        public string? AssignedDiscordUserId { get; set; }
+        public string? AssignedDriverName { get; set; }
+        public string? Notes { get; set; }
+        public DateTimeOffset CreatedUtc { get; set; } = DateTimeOffset.UtcNow;
+        public DateTimeOffset? AcceptedUtc { get; set; }
+        public DateTimeOffset? CompletedUtc { get; set; }
+    }
+
+    private sealed class DispatchAcceptReq
+    {
+        public string? DiscordUserId { get; set; }
+        public string? DriverId { get; set; }
+        public string? DriverName { get; set; }
+        public string? Source { get; set; }
+    }
+
+    private sealed class AtsModInfo
+    {
+        public string FileName { get; set; } = "";
+        public string FullPath { get; set; } = "";
+        public long SizeBytes { get; set; }
+        public DateTimeOffset LastWriteUtc { get; set; }
+        public bool LooksLikeZipReadable { get; set; }
+        public List<string> SampleEntries { get; set; } = new();
+    }
+
+    private sealed class AtsDispatchStore
+    {
+        private readonly object _lock = new();
+        private readonly string _queuePath;
+        private readonly string _activePath;
+        private readonly string _feedPath;
+        private readonly string _completedPath;
+        private readonly string _modDir;
+
+        public AtsDispatchStore(string queuePath, string activePath, string feedPath, string completedPath, string modDir)
+        {
+            _queuePath = queuePath;
+            _activePath = activePath;
+            _feedPath = feedPath;
+            _completedPath = completedPath;
+            _modDir = modDir;
+
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_queuePath) ?? ".");
+                Directory.CreateDirectory(Path.GetDirectoryName(_activePath) ?? ".");
+                Directory.CreateDirectory(Path.GetDirectoryName(_feedPath) ?? ".");
+                Directory.CreateDirectory(Path.GetDirectoryName(_completedPath) ?? ".");
+            }
+            catch { }
+        }
+
+        public List<AtsDispatchJob> GetAvailable(string guildId)
+        {
+            guildId = NormalizeGuildId(guildId);
+
+            lock (_lock)
+            {
+                var list = new List<AtsDispatchJob>();
+
+                list.AddRange(ReadJobsFile(_feedPath, guildId));
+                list.AddRange(ReadJobsFile(_queuePath, guildId));
+
+                var active = ReadJobsFile(_activePath, guildId);
+                var activeIds = new HashSet<string>(
+                    active.Where(x => !string.IsNullOrWhiteSpace(x.Id)).Select(x => x.Id),
+                    StringComparer.OrdinalIgnoreCase);
+
+                list = list
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+                    .Where(x => !activeIds.Contains(x.Id))
+                    .Select(NormalizeJob)
+                    .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.First())
+                    .Where(x => !string.Equals(x.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                    .Where(x => string.IsNullOrWhiteSpace(x.AssignedDiscordUserId))
+                    .OrderByDescending(x => x.CreatedUtc)
+                    .ToList();
+
+                if (list.Count == 0)
+                {
+                    list = BuildFallbackJobsFromMods(guildId);
+                }
+
+                return list;
+            }
+        }
+
+        public List<AtsDispatchJob> GetActive(string guildId)
+        {
+            guildId = NormalizeGuildId(guildId);
+
+            lock (_lock)
+            {
+                return ReadJobsFile(_activePath, guildId)
+                    .Select(NormalizeJob)
+                    .Where(x => !string.Equals(x.Status, "completed", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(x => x.AcceptedUtc ?? x.CreatedUtc)
+                    .ToList();
+            }
+        }
+
+        public List<AtsDispatchJob> GetDriverJobs(string guildId, string driverId)
+        {
+            guildId = NormalizeGuildId(guildId);
+            driverId = (driverId ?? "").Trim();
+
+            if (string.IsNullOrWhiteSpace(driverId))
+                return new List<AtsDispatchJob>();
+
+            return GetActive(guildId)
+                .Where(x =>
+                    string.Equals((x.AssignedDiscordUserId ?? "").Trim(), driverId, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals((x.AssignedDriverName ?? "").Trim(), driverId, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        public AtsDispatchJob? Accept(string guildId, string jobId, string? discordUserId, string? driverName)
+        {
+            guildId = NormalizeGuildId(guildId);
+            jobId = (jobId ?? "").Trim();
+            discordUserId = Clean(discordUserId);
+            driverName = Clean(driverName);
+
+            if (string.IsNullOrWhiteSpace(jobId)) return null;
+
+            lock (_lock)
+            {
+                var queue = ReadJobsFile(_queuePath, guildId);
+                var feed = ReadJobsFile(_feedPath, guildId);
+                var active = ReadJobsFile(_activePath, guildId);
+
+                var job = queue.FirstOrDefault(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase))
+                       ?? feed.FirstOrDefault(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+
+                if (job == null)
+                {
+                    job = BuildFallbackJobsFromMods(guildId)
+                        .FirstOrDefault(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+                }
+
+                if (job == null) return null;
+
+                queue.RemoveAll(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+                feed.RemoveAll(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+                active.RemoveAll(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+
+                job = NormalizeJob(job);
+                job.GuildId = guildId;
+                job.Status = "active";
+                job.AssignedDiscordUserId = discordUserId;
+                job.AssignedDriverName = driverName;
+                job.AcceptedUtc = DateTimeOffset.UtcNow;
+
+                active.Add(job);
+
+                WriteJobsFile(_queuePath, queue);
+                WriteJobsFile(_feedPath, feed);
+                WriteJobsFile(_activePath, active);
+
+                return job;
+            }
+        }
+
+        public AtsDispatchJob? Complete(string guildId, string jobId)
+        {
+            guildId = NormalizeGuildId(guildId);
+            jobId = (jobId ?? "").Trim();
+
+            if (string.IsNullOrWhiteSpace(jobId)) return null;
+
+            lock (_lock)
+            {
+                var active = ReadJobsFile(_activePath, guildId);
+                var completed = ReadJobsFile(_completedPath, guildId);
+
+                var job = active.FirstOrDefault(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+                if (job == null) return null;
+
+                active.RemoveAll(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+
+                job = NormalizeJob(job);
+                job.Status = "completed";
+                job.CompletedUtc = DateTimeOffset.UtcNow;
+
+                completed.RemoveAll(x => string.Equals(x.Id, jobId, StringComparison.OrdinalIgnoreCase));
+                completed.Add(job);
+
+                WriteJobsFile(_activePath, active);
+                WriteJobsFile(_completedPath, completed);
+
+                return job;
+            }
+        }
+
+        public List<AtsModInfo> ScanMods(int take)
+        {
+            take = Math.Clamp(take, 1, 200);
+
+            var list = new List<AtsModInfo>();
+            try
+            {
+                if (!Directory.Exists(_modDir)) return list;
+
+                foreach (var file in Directory.EnumerateFiles(_modDir)
+                    .Where(f => f.EndsWith(".scs", StringComparison.OrdinalIgnoreCase) ||
+                                f.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(f => File.GetLastWriteTimeUtc(f))
+                    .Take(take))
+                {
+                    var fi = new FileInfo(file);
+                    var info = new AtsModInfo
+                    {
+                        FileName = fi.Name,
+                        FullPath = fi.FullName,
+                        SizeBytes = fi.Exists ? fi.Length : 0,
+                        LastWriteUtc = fi.Exists ? fi.LastWriteTimeUtc : DateTime.UtcNow,
+                        LooksLikeZipReadable = false,
+                        SampleEntries = new List<string>()
+                    };
+
+                    try
+                    {
+                        using var archive = ZipFile.OpenRead(file);
+                        info.LooksLikeZipReadable = true;
+                        foreach (var entry in archive.Entries
+                                     .Select(e => e.FullName)
+                                     .Where(x => !string.IsNullOrWhiteSpace(x))
+                                     .Take(10))
+                        {
+                            info.SampleEntries.Add(entry);
+                        }
+                    }
+                    catch
+                    {
+                        info.LooksLikeZipReadable = false;
+                    }
+
+                    list.Add(info);
+                }
+            }
+            catch { }
+
+            return list;
+        }
+
+        private List<AtsDispatchJob> BuildFallbackJobsFromMods(string guildId)
+        {
+            var mods = ScanMods(50);
+            var jobs = new List<AtsDispatchJob>();
+
+            foreach (var m in mods)
+            {
+                var cargo = GuessCargoFromModName(m.FileName);
+                var title = string.IsNullOrWhiteSpace(cargo) ? Path.GetFileNameWithoutExtension(m.FileName) : cargo;
+
+                jobs.Add(new AtsDispatchJob
+                {
+                    Id = "mod-" + Sha1Hex(m.FileName).Substring(0, 12),
+                    GuildId = guildId,
+                    Source = "ats-mod",
+                    Title = title,
+                    Cargo = cargo,
+                    ModName = m.FileName,
+                    Origin = "ATS Dispatch Pool",
+                    Destination = "Assigned Route",
+                    OriginCity = "ATS Dispatch Pool",
+                    DestinationCity = "Assigned Route",
+                    Company = "Mod Cargo",
+                    DistanceMiles = 0,
+                    Status = "available",
+                    Notes = "Generated from ATS mod folder fallback.",
+                    CreatedUtc = m.LastWriteUtc
+                });
+            }
+
+            return jobs
+                .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .OrderByDescending(x => x.CreatedUtc)
+                .ToList();
+        }
+
+        private List<AtsDispatchJob> ReadJobsFile(string path, string guildId)
+        {
+            var list = new List<AtsDispatchJob>();
+
+            try
+            {
+                if (!File.Exists(path)) return list;
+                var json = File.ReadAllText(path);
+                if (string.IsNullOrWhiteSpace(json)) return list;
+
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                if (root.ValueKind == JsonValueKind.Array)
+                {
+                    var arr = JsonSerializer.Deserialize<List<AtsDispatchJob>>(root.GetRawText(), JsonReadOpts);
+                    if (arr != null) list.AddRange(arr);
+                }
+                else if (root.ValueKind == JsonValueKind.Object)
+                {
+                    if (root.TryGetProperty("jobs", out var jobsEl) && jobsEl.ValueKind == JsonValueKind.Array)
+                    {
+                        var arr = JsonSerializer.Deserialize<List<AtsDispatchJob>>(jobsEl.GetRawText(), JsonReadOpts);
+                        if (arr != null) list.AddRange(arr);
+                    }
+                    else if (root.TryGetProperty("queue", out var queueEl) && queueEl.ValueKind == JsonValueKind.Array)
+                    {
+                        var arr = JsonSerializer.Deserialize<List<AtsDispatchJob>>(queueEl.GetRawText(), JsonReadOpts);
+                        if (arr != null) list.AddRange(arr);
+                    }
+                    else if (root.TryGetProperty("drivers", out _))
+                    {
+                        // ignore telemetry-like payloads
+                    }
+                    else
+                    {
+                        try
+                        {
+                            var single = JsonSerializer.Deserialize<AtsDispatchJob>(root.GetRawText(), JsonReadOpts);
+                            if (single != null) list.Add(single);
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+
+            guildId = NormalizeGuildId(guildId);
+
+            return list
+                .Select(NormalizeJob)
+                .Where(x => string.IsNullOrWhiteSpace(x.GuildId) || string.Equals(x.GuildId, guildId, StringComparison.OrdinalIgnoreCase))
+                .Select(x =>
+                {
+                    x.GuildId = guildId;
+                    return x;
+                })
+                .ToList();
+        }
+
+        private void WriteJobsFile(string path, List<AtsDispatchJob> jobs)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
+                File.WriteAllText(path, JsonSerializer.Serialize(jobs, JsonWriteOpts));
+            }
+            catch { }
+        }
+
+        private static AtsDispatchJob NormalizeJob(AtsDispatchJob job)
+        {
+            job.Id = (job.Id ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(job.Id))
+            {
+                var raw = $"{job.Title}|{job.Cargo}|{job.Origin}|{job.Destination}|{job.ModName}";
+                job.Id = "job-" + Sha1Hex(raw).Substring(0, 12);
+            }
+
+            job.GuildId = NormalizeGuildId(job.GuildId);
+            job.Source = string.IsNullOrWhiteSpace(job.Source) ? "dispatcher" : job.Source.Trim();
+            job.Status = string.IsNullOrWhiteSpace(job.Status) ? "available" : job.Status.Trim().ToLowerInvariant();
+
+            job.Title = Clean(job.Title);
+            job.Cargo = Clean(job.Cargo) ?? job.Title;
+            job.Trailer = Clean(job.Trailer);
+            job.Origin = Clean(job.Origin) ?? Clean(job.OriginCity);
+            job.Destination = Clean(job.Destination) ?? Clean(job.DestinationCity);
+            job.OriginCity = Clean(job.OriginCity) ?? job.Origin;
+            job.DestinationCity = Clean(job.DestinationCity) ?? job.Destination;
+            job.Company = Clean(job.Company);
+            job.ModName = Clean(job.ModName);
+            job.AssignedDiscordUserId = Clean(job.AssignedDiscordUserId);
+            job.AssignedDriverName = Clean(job.AssignedDriverName);
+            job.Notes = Clean(job.Notes);
+
+            if (job.CreatedUtc == default) job.CreatedUtc = DateTimeOffset.UtcNow;
+            return job;
+        }
+
+        private static string NormalizeGuildId(string? guildId)
+        {
+            guildId = (guildId ?? "").Trim();
+            return string.IsNullOrWhiteSpace(guildId) ? "0" : guildId;
+        }
+
+        private static string? Clean(string? s)
+        {
+            s = (s ?? "").Trim();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+
+        private static string GuessCargoFromModName(string fileName)
+        {
+            var n = Path.GetFileNameWithoutExtension(fileName ?? "").Replace('_', ' ').Replace('-', ' ').Trim();
+            if (string.IsNullOrWhiteSpace(n)) return "Custom Load";
+
+            if (n.Contains("reefer", StringComparison.OrdinalIgnoreCase)) return "Reefer Load";
+            if (n.Contains("heavy", StringComparison.OrdinalIgnoreCase)) return "Heavy Haul";
+            if (n.Contains("oversize", StringComparison.OrdinalIgnoreCase)) return "Oversize Load";
+            if (n.Contains("trailer", StringComparison.OrdinalIgnoreCase)) return "Trailer Load";
+            if (n.Contains("cargo", StringComparison.OrdinalIgnoreCase)) return "Cargo Load";
+            if (n.Contains("truck", StringComparison.OrdinalIgnoreCase)) return "Truck Assignment";
+
+            return n;
+        }
+    }
 
     // -----------------------------
     // ✅ Performance models
@@ -360,18 +822,18 @@ internal static class Program
                 if (existing == null)
                 {
                     var d = new VtcDriver
-{
-    DriverId = string.IsNullOrWhiteSpace(incoming.DriverId) ? Guid.NewGuid().ToString("N") : incoming.DriverId,
-    Name = incoming.Name,
-    DiscordUserId = Clean(incoming.DiscordUserId),
-    DiscordUsername = Clean(incoming.DiscordUsername),
-    TruckNumber = Clean(incoming.TruckNumber),
-    Role = Clean(incoming.Role),
-    Status = Clean(incoming.Status),
-    Notes = Clean(incoming.Notes),
-    CreatedUtc = DateTimeOffset.UtcNow,
-    UpdatedUtc = DateTimeOffset.UtcNow
-};
+                    {
+                        DriverId = string.IsNullOrWhiteSpace(incoming.DriverId) ? Guid.NewGuid().ToString("N") : incoming.DriverId,
+                        Name = incoming.Name,
+                        DiscordUserId = Clean(incoming.DiscordUserId),
+                        DiscordUsername = Clean(incoming.DiscordUsername),
+                        TruckNumber = Clean(incoming.TruckNumber),
+                        Role = Clean(incoming.Role),
+                        Status = Clean(incoming.Status),
+                        Notes = Clean(incoming.Notes),
+                        CreatedUtc = DateTimeOffset.UtcNow,
+                        UpdatedUtc = DateTimeOffset.UtcNow
+                    };
 
                     list.Add(d);
                     Save();
@@ -380,11 +842,11 @@ internal static class Program
 
                 // update existing
                 existing.DiscordUserId = Clean(incoming.DiscordUserId) ?? existing.DiscordUserId;
-existing.DiscordUsername = Clean(incoming.DiscordUsername) ?? existing.DiscordUsername;
-existing.TruckNumber = Clean(incoming.TruckNumber) ?? existing.TruckNumber;
-existing.Role = Clean(incoming.Role) ?? existing.Role;
-existing.Status = Clean(incoming.Status) ?? existing.Status;
-existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
+                existing.DiscordUsername = Clean(incoming.DiscordUsername) ?? existing.DiscordUsername;
+                existing.TruckNumber = Clean(incoming.TruckNumber) ?? existing.TruckNumber;
+                existing.Role = Clean(incoming.Role) ?? existing.Role;
+                existing.Status = Clean(incoming.Status) ?? existing.Status;
+                existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
 
                 if (!string.IsNullOrWhiteSpace(incoming.Name))
                     existing.Name = incoming.Name;
@@ -449,31 +911,31 @@ existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
         }
 
         private static VtcDriver Clone(VtcDriver d) => new VtcDriver
-{
-    DriverId = d.DriverId,
-    Name = d.Name,
-    DiscordUserId = d.DiscordUserId,
-    DiscordUsername = d.DiscordUsername,
-    TruckNumber = d.TruckNumber,
-    Role = d.Role,
-    Status = d.Status,
-    Notes = d.Notes,
-    CreatedUtc = d.CreatedUtc,
-    UpdatedUtc = d.UpdatedUtc
-};
+        {
+            DriverId = d.DriverId,
+            Name = d.Name,
+            DiscordUserId = d.DiscordUserId,
+            DiscordUsername = d.DiscordUsername,
+            TruckNumber = d.TruckNumber,
+            Role = d.Role,
+            Status = d.Status,
+            Notes = d.Notes,
+            CreatedUtc = d.CreatedUtc,
+            UpdatedUtc = d.UpdatedUtc
+        };
     }
 
     private sealed class RosterUpsertReq
-{
-    public string? DriverId { get; set; }
-    public string? Name { get; set; }
-    public string? DiscordUserId { get; set; }
-    public string? DiscordUsername { get; set; }
-    public string? TruckNumber { get; set; }
-    public string? Role { get; set; }
-    public string? Status { get; set; }
-    public string? Notes { get; set; }
-}
+    {
+        public string? DriverId { get; set; }
+        public string? Name { get; set; }
+        public string? DiscordUserId { get; set; }
+        public string? DiscordUsername { get; set; }
+        public string? TruckNumber { get; set; }
+        public string? Role { get; set; }
+        public string? Status { get; set; }
+        public string? Notes { get; set; }
+    }
 
     // ✅ helper for !rosterLink
     private static ulong? TryParseUserIdFromMentionOrId(string raw)
@@ -828,6 +1290,7 @@ existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
     {
         Directory.CreateDirectory(DataDir);
         Directory.CreateDirectory(PerfDir);
+        try { Directory.CreateDirectory(AtsBridgeDir); } catch { }
 
         _threadStore = new ThreadMapStore(ThreadMapPath);
         _dispatchStore = new DispatchSettingsStore(DispatchCfgPath);
@@ -837,6 +1300,13 @@ existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
         _linkedDriversStore = new LinkedDriversStore(LinkedDriversPath);
 
         _perfStore = new PerformanceStore(PerfDir);
+        _atsDispatchStore = new AtsDispatchStore(
+            DispatchQueuePath,
+            DispatchActivePath,
+            DispatchFeedPath,
+            DispatchCompletedPath,
+            AtsModDir
+        );
 
         var token = (Environment.GetEnvironmentVariable("DISCORD_TOKEN") ?? "").Trim();
         if (string.IsNullOrWhiteSpace(token))
@@ -915,28 +1385,28 @@ existing.Notes = Clean(incoming.Notes) ?? existing.Notes;
         if (!int.TryParse(portStr, out var port)) port = 8080;
 
         var builder = WebApplication.CreateBuilder();
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+        builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("LiveMapCors", policy =>
-    {
-        policy
-            .AllowAnyHeader()
-            .AllowAnyMethod()
-            .SetIsOriginAllowed(_ => true);
-    });
-});
+        builder.Services.AddCors(options =>
+        {
+            options.AddPolicy("LiveMapCors", policy =>
+            {
+                policy
+                    .AllowAnyHeader()
+                    .AllowAnyMethod()
+                    .SetIsOriginAllowed(_ => true);
+            });
+        });
 
-var app = builder.Build();
+        var app = builder.Build();
 
-app.UseCors("LiveMapCors");
+        app.UseCors("LiveMapCors");
 
         app.UseDefaultFiles();
         app.UseStaticFiles();
 
         app.MapGet("/health", () => Results.Ok(new { ok = true }));
-        app.MapGet("/build", () => Results.Ok(new { ok = true, name = "OverWatchELD.VtcBot", version = "link-eld-claim+webhook-create+performance-slash+livemap" }));
+        app.MapGet("/build", () => Results.Ok(new { ok = true, name = "OverWatchELD.VtcBot", version = "link-eld-claim+webhook-create+performance-slash+livemap+ats-dispatch" }));
 
         // ✅ LIVE MAP: PMTiles host (byte-range capable via PmtilesRangeResult)
         // Put Maps/usa.pmtiles in project root under Maps/
@@ -1005,84 +1475,85 @@ app.UseCors("LiveMapCors");
         // POST /api/vtc/webhook/create?guildId=...&channelId=...&type=logs|inspections|bols|announcement
         // -----------------------------
         r.MapPost("/vtc/webhook/create", async (HttpRequest req) =>
-{
-    if (_client == null || !_discordReady)
-        return Results.Json(new { ok = false, error = "DiscordNotReady" }, statusCode: 503);
-
-    var guildIdStr = (req.Query["guildId"].ToString() ?? "").Trim();
-    var channelIdStr = (req.Query["channelId"].ToString() ?? "").Trim();
-    var type = (req.Query["type"].ToString() ?? "").Trim().ToLowerInvariant();
-
-    if (!ulong.TryParse(guildIdStr, out var gid) || gid == 0)
-        return Results.Json(new { ok = false, error = "InvalidGuildId" }, statusCode: 400);
-
-    if (!ulong.TryParse(channelIdStr, out var cid) || cid == 0)
-        return Results.Json(new { ok = false, error = "InvalidChannelId" }, statusCode: 400);
-
-    var guild = _client.Guilds.FirstOrDefault(x => x.Id == gid);
-    if (guild == null)
-        return Results.Json(new { ok = false, error = "GuildNotFound" }, statusCode: 404);
-
-    var ch = guild.GetTextChannel(cid);
-    if (ch == null)
-        return Results.Json(new { ok = false, error = "ChannelNotFound" }, statusCode: 404);
-
-    var hookName = type switch
-    {
-        "dispatch" => "OverWatchELD Dispatch",
-        "logs" => "OverWatchELD Logs",
-        "inspections" => "OverWatchELD Inspections",
-        "bols" => "OverWatchELD BOLs",
-        "announcement" => "OverWatchELD Announcements",
-        "announcements" => "OverWatchELD Announcements",
-        _ => "OverWatchELD"
-    };
-
-    try
-    {
-        var hook = await ch.CreateWebhookAsync(hookName);
-        var token = (hook.Token ?? "").Trim();
-        var url = string.IsNullOrWhiteSpace(token)
-            ? ""
-            : $"https://discord.com/api/webhooks/{hook.Id}/{token}";
-
-        if (_dispatchStore != null)
         {
-            if (type == "dispatch")
+            if (_client == null || !_discordReady)
+                return Results.Json(new { ok = false, error = "DiscordNotReady" }, statusCode: 503);
+
+            var guildIdStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var channelIdStr = (req.Query["channelId"].ToString() ?? "").Trim();
+            var type = (req.Query["type"].ToString() ?? "").Trim().ToLowerInvariant();
+
+            if (!ulong.TryParse(guildIdStr, out var gid) || gid == 0)
+                return Results.Json(new { ok = false, error = "InvalidGuildId" }, statusCode: 400);
+
+            if (!ulong.TryParse(channelIdStr, out var cid) || cid == 0)
+                return Results.Json(new { ok = false, error = "InvalidChannelId" }, statusCode: 400);
+
+            var guild = _client.Guilds.FirstOrDefault(x => x.Id == gid);
+            if (guild == null)
+                return Results.Json(new { ok = false, error = "GuildNotFound" }, statusCode: 404);
+
+            var ch = guild.GetTextChannel(cid);
+            if (ch == null)
+                return Results.Json(new { ok = false, error = "ChannelNotFound" }, statusCode: 404);
+
+            var hookName = type switch
             {
-                _dispatchStore.SetDispatchChannel(gid.ToString(), ch.Id);
-                if (!string.IsNullOrWhiteSpace(url))
-                    _dispatchStore.SetDispatchWebhook(gid.ToString(), url);
-            }
+                "dispatch" => "OverWatchELD Dispatch",
+                "logs" => "OverWatchELD Logs",
+                "inspections" => "OverWatchELD Inspections",
+                "bols" => "OverWatchELD BOLs",
+                "announcement" => "OverWatchELD Announcements",
+                "announcements" => "OverWatchELD Announcements",
+                _ => "OverWatchELD"
+            };
 
-            if (type == "announcement" || type == "announcements")
+            try
             {
-                _dispatchStore.SetAnnouncementChannel(gid.ToString(), ch.Id);
-                if (!string.IsNullOrWhiteSpace(url))
-                    _dispatchStore.SetAnnouncementWebhook(gid.ToString(), url);
-            }
-        }
+                var hook = await ch.CreateWebhookAsync(hookName);
+                var token = (hook.Token ?? "").Trim();
+                var url = string.IsNullOrWhiteSpace(token)
+                    ? ""
+                    : $"https://discord.com/api/webhooks/{hook.Id}/{token}";
 
-        return Results.Json(new
-        {
-            ok = true,
-            type,
-            guildId = gid.ToString(),
-            channelId = ch.Id.ToString(),
-            webhookUrl = url,
-            saved = type == "dispatch" || type == "announcement" || type == "announcements"
-        }, JsonWriteOpts);
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(new
-        {
-            ok = false,
-            error = "WebhookCreateFailed",
-            message = ex.Message
-        }, statusCode: 500);
-    }
-});
+                if (_dispatchStore != null)
+                {
+                    if (type == "dispatch")
+                    {
+                        _dispatchStore.SetDispatchChannel(gid.ToString(), ch.Id);
+                        if (!string.IsNullOrWhiteSpace(url))
+                            _dispatchStore.SetDispatchWebhook(gid.ToString(), url);
+                    }
+
+                    if (type == "announcement" || type == "announcements")
+                    {
+                        _dispatchStore.SetAnnouncementChannel(gid.ToString(), ch.Id);
+                        if (!string.IsNullOrWhiteSpace(url))
+                            _dispatchStore.SetAnnouncementWebhook(gid.ToString(), url);
+                    }
+                }
+
+                return Results.Json(new
+                {
+                    ok = true,
+                    type,
+                    guildId = gid.ToString(),
+                    channelId = ch.Id.ToString(),
+                    webhookUrl = url,
+                    saved = type == "dispatch" || type == "announcement" || type == "announcements"
+                }, JsonWriteOpts);
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new
+                {
+                    ok = false,
+                    error = "WebhookCreateFailed",
+                    message = ex.Message
+                }, statusCode: 500);
+            }
+        });
+
         // -----------------------------
         // ✅ NEW: Performance PUSH (ELD -> Bot)
         // POST /api/performance/update?guildId=...
@@ -1146,6 +1617,105 @@ app.UseCors("LiveMapCors");
         });
 
         // -----------------------------
+        // ✅ NEW: ATS Dispatch bridge routes
+        // -----------------------------
+        r.MapGet("/dispatch/jobs", (HttpRequest req) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            var guildId = guild?.Id.ToString() ?? ((string.IsNullOrWhiteSpace(gidStr) ? "0" : gidStr));
+
+            var jobs = _atsDispatchStore.GetAvailable(guildId);
+            return Results.Json(new { ok = true, guildId, jobs }, JsonWriteOpts);
+        });
+
+        r.MapGet("/dispatch/active", (HttpRequest req) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            var guildId = guild?.Id.ToString() ?? ((string.IsNullOrWhiteSpace(gidStr) ? "0" : gidStr));
+
+            var jobs = _atsDispatchStore.GetActive(guildId);
+            return Results.Json(new { ok = true, guildId, jobs }, JsonWriteOpts);
+        });
+
+        r.MapGet("/dispatch/driver/{driverId}", (HttpRequest req, string driverId) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            var guildId = guild?.Id.ToString() ?? ((string.IsNullOrWhiteSpace(gidStr) ? "0" : gidStr));
+
+            var jobs = _atsDispatchStore.GetDriverJobs(guildId, driverId);
+            return Results.Json(new { ok = true, guildId, driverId, jobs }, JsonWriteOpts);
+        });
+
+        r.MapPost("/dispatch/accept/{id}", async (HttpRequest req, string id) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            var guildId = guild?.Id.ToString() ?? ((string.IsNullOrWhiteSpace(gidStr) ? "0" : gidStr));
+
+            DispatchAcceptReq? payload;
+            try { payload = await JsonSerializer.DeserializeAsync<DispatchAcceptReq>(req.Body, JsonReadOpts); }
+            catch { payload = null; }
+
+            var driverId = (payload?.DiscordUserId ?? payload?.DriverId ?? "").Trim();
+            var driverName = (payload?.DriverName ?? "").Trim();
+
+            var job = _atsDispatchStore.Accept(guildId, id, driverId, driverName);
+            if (job == null)
+                return Results.Json(new { ok = false, error = "JobNotFound" }, statusCode: 404);
+
+            return Results.Json(new { ok = true, guildId, job }, JsonWriteOpts);
+        });
+
+        r.MapPost("/dispatch/complete/{id}", (HttpRequest req, string id) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            var guildId = guild?.Id.ToString() ?? ((string.IsNullOrWhiteSpace(gidStr) ? "0" : gidStr));
+
+            var job = _atsDispatchStore.Complete(guildId, id);
+            if (job == null)
+                return Results.Json(new { ok = false, error = "JobNotFoundOrNotActive" }, statusCode: 404);
+
+            return Results.Json(new { ok = true, guildId, job }, JsonWriteOpts);
+        });
+
+        r.MapGet("/dispatch/mods", (HttpRequest req) =>
+        {
+            if (_atsDispatchStore == null)
+                return Results.Json(new { ok = false, error = "DispatchStoreNotReady" }, statusCode: 503);
+
+            var takeStr = (req.Query["take"].ToString() ?? "50").Trim();
+            if (!int.TryParse(takeStr, out var take)) take = 50;
+
+            var mods = _atsDispatchStore.ScanMods(take);
+            return Results.Json(new
+            {
+                ok = true,
+                modFolder = AtsModDir,
+                exists = Directory.Exists(AtsModDir),
+                mods
+            }, JsonWriteOpts);
+        });
+
+        // -----------------------------
         // ✅ ELD PAIRING CLAIM
         // GET /api/vtc/pair/claim?code=ABC123
         // -----------------------------
@@ -1198,33 +1768,33 @@ app.UseCors("LiveMapCors");
         // ✅ VTC Roster API (manual drivers)
         // -----------------------------
         r.MapGet("/vtc/roster", (HttpRequest req) =>
-{
-    var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
-    var guild = ResolveGuild(gidStr);
-    if (guild == null) return Results.Json(new { ok = false, error = "GuildNotFound" }, statusCode: 404);
-
-    if (_rosterStore == null) return Results.Json(new { ok = false, error = "RosterNotReady" }, statusCode: 503);
-
-    var list = _rosterStore.List(guild.Id.ToString())
-        .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
-        .Select(d => new
         {
-            driverId = d.DriverId,
-            name = d.Name,
-            driverName = d.Name,
-            discordUserId = d.DiscordUserId ?? "",
-            discordUsername = d.DiscordUsername ?? "",
-            truckNumber = d.TruckNumber ?? "",
-            role = string.IsNullOrWhiteSpace(d.Role) ? "Driver" : d.Role,
-            status = d.Status ?? "",
-            notes = d.Notes ?? "",
-            createdUtc = d.CreatedUtc,
-            updatedUtc = d.UpdatedUtc
-        })
-        .ToArray();
+            var gidStr = (req.Query["guildId"].ToString() ?? "").Trim();
+            var guild = ResolveGuild(gidStr);
+            if (guild == null) return Results.Json(new { ok = false, error = "GuildNotFound" }, statusCode: 404);
 
-    return Results.Json(new { ok = true, guildId = guild.Id.ToString(), drivers = list }, JsonWriteOpts);
-});
+            if (_rosterStore == null) return Results.Json(new { ok = false, error = "RosterNotReady" }, statusCode: 503);
+
+            var list = _rosterStore.List(guild.Id.ToString())
+                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(d => new
+                {
+                    driverId = d.DriverId,
+                    name = d.Name,
+                    driverName = d.Name,
+                    discordUserId = d.DiscordUserId ?? "",
+                    discordUsername = d.DiscordUsername ?? "",
+                    truckNumber = d.TruckNumber ?? "",
+                    role = string.IsNullOrWhiteSpace(d.Role) ? "Driver" : d.Role,
+                    status = d.Status ?? "",
+                    notes = d.Notes ?? "",
+                    createdUtc = d.CreatedUtc,
+                    updatedUtc = d.UpdatedUtc
+                })
+                .ToArray();
+
+            return Results.Json(new { ok = true, guildId = guild.Id.ToString(), drivers = list }, JsonWriteOpts);
+        });
 
         r.MapPost("/vtc/roster/add", async (HttpRequest req) =>
         {
@@ -1244,17 +1814,17 @@ app.UseCors("LiveMapCors");
             try
             {
                 var saved = _rosterStore.AddOrUpdateByName(guild.Id.ToString(), new VtcDriver
-{
-    DriverId = (payload.DriverId ?? "").Trim(),
-    Name = (payload.Name ?? "").Trim(),
-    DiscordUserId = (payload.DiscordUserId ?? "").Trim(),
-    DiscordUsername = (payload.DiscordUsername ?? "").Trim(),
-    TruckNumber = (payload.TruckNumber ?? "").Trim(),
-    Role = (payload.Role ?? "").Trim(),
-    Status = (payload.Status ?? "").Trim(),
-    Notes = (payload.Notes ?? "").Trim()
-});
- 
+                {
+                    DriverId = (payload.DriverId ?? "").Trim(),
+                    Name = (payload.Name ?? "").Trim(),
+                    DiscordUserId = (payload.DiscordUserId ?? "").Trim(),
+                    DiscordUsername = (payload.DiscordUsername ?? "").Trim(),
+                    TruckNumber = (payload.TruckNumber ?? "").Trim(),
+                    Role = (payload.Role ?? "").Trim(),
+                    Status = (payload.Status ?? "").Trim(),
+                    Notes = (payload.Notes ?? "").Trim()
+                });
+
                 return Results.Json(new { ok = true, driver = saved }, JsonWriteOpts);
             }
             catch (Exception ex)
@@ -1285,6 +1855,7 @@ app.UseCors("LiveMapCors");
                     DriverId = (payload.DriverId ?? "").Trim(),
                     Name = (payload.Name ?? "").Trim(),
                     DiscordUserId = (payload.DiscordUserId ?? "").Trim(),
+                    DiscordUsername = (payload.DiscordUsername ?? "").Trim(),
                     TruckNumber = (payload.TruckNumber ?? "").Trim(),
                     Role = (payload.Role ?? "").Trim(),
                     Status = (payload.Status ?? "").Trim(),
@@ -2098,12 +2669,12 @@ app.UseCors("LiveMapCors");
             try
             {
                 var saved = _rosterStore.AddOrUpdateByName(guildIdStr, new VtcDriver
-{
-    Name = driverName.Trim(),
-    DiscordUserId = uid.Value.ToString(),
-    DiscordUsername = (u?.Username ?? "").Trim(),
-    Role = "Driver"
-});
+                {
+                    Name = driverName.Trim(),
+                    DiscordUserId = uid.Value.ToString(),
+                    DiscordUsername = (u?.Username ?? "").Trim(),
+                    Role = "Driver"
+                });
 
                 await msg.Channel.SendMessageAsync($"✅ Roster linked: **{saved.Name}** ↔ <@{uid.Value}>");
             }
@@ -2257,6 +2828,15 @@ app.UseCors("LiveMapCors");
         catch { return null; }
     }
 
+    private static string Sha1Hex(string input)
+    {
+        using var sha = SHA1.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input ?? ""));
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes) sb.Append(b.ToString("x2"));
+        return sb.ToString();
+    }
+
     // Thread mapping helpers (reflection-safe)
     private static ulong ThreadStoreTryGet(ulong guildId, ulong userId)
     {
@@ -2377,6 +2957,3 @@ app.UseCors("LiveMapCors");
             await rt.ModifyAsync(p => p.Archived = false);
     }
 }
-
-
-
